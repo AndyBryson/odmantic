@@ -1,7 +1,8 @@
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union, Any
 
 import pytest
 
+# from docs.examples_src.fields import optional
 from odmantic.engine import AIOEngine, SyncEngine
 from odmantic.field import Field
 from odmantic.model import EmbeddedModel, Model
@@ -311,3 +312,43 @@ def test_sync_embedded_model_dict_custom_key_name_save_and_fetch(
     sync_engine.save(instance)
     fetched = sync_engine.find_one(Out)
     assert instance == fetched
+
+
+@pytest.mark.parametrize("optional_missing", [False, True])
+async def test_embedded_model_optional(aio_engine: AIOEngine, optional_missing: bool):
+    class E(EmbeddedModel):
+        f: int
+
+    class M(Model):
+        e: Union[E, None]
+
+    m = M(e=None) if optional_missing else M(e=E(f=3))
+    await aio_engine.save(m)
+    fetched = await aio_engine.find_one(M)
+    assert fetched == m
+
+    doc: Dict[str, Any] = {
+        "_id": str(m.id),
+        "e": None if optional_missing else {"f": 3},
+    }
+    assert M.model_validate_doc(doc) == m
+
+
+@pytest.mark.parametrize("optional_missing", [False, True])
+def test_sync_embedded_model_optional(sync_engine: SyncEngine, optional_missing: bool):
+    class E(EmbeddedModel):
+        f: int
+
+    class M(Model):
+        e: Union[E, None]
+
+    m = M(e=None) if optional_missing else M(e=E(f=3))
+    sync_engine.save(m)
+    fetched = sync_engine.find_one(M)
+    assert fetched == m
+
+    doc: Dict[str, Any] = {
+        "_id": str(m.id),
+        "e": None if optional_missing else {"f": 3},
+    }
+    assert M.model_validate_doc(doc) == m

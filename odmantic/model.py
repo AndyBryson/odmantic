@@ -4,6 +4,7 @@ import datetime
 import decimal
 import enum
 import pathlib
+import sys
 import uuid
 from abc import ABCMeta
 from collections.abc import Callable as abcCallable
@@ -38,13 +39,18 @@ from pydantic.main import BaseModel
 from pydantic_core import InitErrorDetails
 from typing_extensions import Literal, deprecated
 
+if sys.version_info < (3, 9):
+    from typing_extensions import Annotated
+else:
+    from typing import Annotated
+
 from odmantic.bson import (
     _BSON_SUBSTITUTED_FIELDS,
     BaseBSONModel,
     ObjectId,
     _get_bson_serializer,
 )
-from odmantic.config import ODMConfigDict, validate_config
+from odmantic.config import ODMConfigDict, combine_configs, validate_config
 from odmantic.exceptions import (
     DocumentParsingError,
     IncorrectGenericEmbeddedModelValue,
@@ -147,6 +153,8 @@ def is_type_mutable(type_: Type) -> bool:
     type_origin: Optional[Type] = getattr(type_, "__origin__", None)
     if type_origin is not None:
         type_args: Tuple[Type, ...] = getattr(type_, "__args__", ())
+        if type_origin == Annotated and type_args:
+            return is_type_mutable(type_args[0])
         for type_arg in type_args:
             if type_arg is ...:  # Handle tuple definition
                 continue
@@ -206,17 +214,36 @@ def validate_type(type_: Type) -> Type:
 class BaseModelMetaclass(pydantic._internal._model_construction.ModelMetaclass):
     @staticmethod
     def __validate_cls_namespace__(  # noqa C901
-        name: str, namespace: Dict[str, Any]
+        name: str, bases: list[_BaseODMModel], namespace: Dict[str, Any]
     ) -> None:
         """Validate the class name space in place"""
         annotations = resolve_annotations(
             namespace.get("__annotations__", {}), namespace.get("__module__")
         )
-        config = validate_config(namespace.get("model_config", ODMConfigDict()), name)
+
+        this_config = namespace.get("model_config", None)
+
+        unvalidated_bases = [
+            x.model_config
+            for x in bases
+            if hasattr(x, "model_config") and x.model_config
+        ]
+        if this_config is not None:
+            unvalidated_bases.append(this_config)
+
+        combined_configs = combine_configs(unvalidated_bases)
+
+        config = validate_config(combined_configs, name)
         odm_fields: Dict[str, ODMBaseField] = {}
         references: List[str] = []
         bson_serializers: Dict[str, Callable[[Any], Any]] = {}
         mutable_fields: Set[str] = set()
+
+        # we have these checks so that we only take bits from bases if they are not
+        # overridden in the current class
+        not_bson_fields: Set[str] = set()
+        not_mutable_fields: Set[str] = set()
+        not_reference_fields: Set[str] = set()
 
         # Make sure all fields are defined with type annotation
         for field_name, value in namespace.items():
@@ -240,6 +267,8 @@ class BaseModelMetaclass(pydantic._internal._model_construction.ModelMetaclass):
                 bson_serializer = _get_bson_serializer(substituted_type)
                 if bson_serializer is not None:
                     bson_serializers[field_name] = bson_serializer
+                else:
+                    not_bson_fields.add(field_name)
 
         # Validate fields
         for field_name, field_type in annotations.items():
@@ -254,6 +283,8 @@ class BaseModelMetaclass(pydantic._internal._model_construction.ModelMetaclass):
 
             if is_type_mutable(field_type):
                 mutable_fields.add(field_name)
+            else:
+                not_mutable_fields.add(field_name)
 
             if lenient_issubclass(field_type, EmbeddedModel):
                 if isinstance(value, ODMFieldInfo):
@@ -328,6 +359,7 @@ class BaseModelMetaclass(pydantic._internal._model_construction.ModelMetaclass):
                 references.append(field_name)
                 del namespace[field_name]  # Remove default ODMReferenceInfo value
             else:
+                not_reference_fields.add(field_name)
                 if isinstance(value, ODMFieldInfo):
                     key_name = (
                         value.key_name if value.key_name is not None else field_name
@@ -358,6 +390,33 @@ class BaseModelMetaclass(pydantic._internal._model_construction.ModelMetaclass):
                     odm_fields[field_name] = ODMField(
                         primary_field=False, key_name=field_name, model_config=config
                     )
+
+        # get the bits from parent objects
+
+        if bases:
+            base = bases[-1]
+            if hasattr(base, "__bson_serializers__"):
+                base_bson_serializers: Dict[str, Callable] = {
+                    key: value
+                    for key, value in base.__bson_serializers__.items()
+                    if key not in not_bson_fields
+                }
+                bson_serializers = {**base_bson_serializers, **bson_serializers}
+
+            if hasattr(base, "__mutable_fields__"):
+                base_mutable_fields = {
+                    key
+                    for key in base.__mutable_fields__
+                    if key not in not_mutable_fields
+                }
+                mutable_fields = base_mutable_fields | mutable_fields
+            if hasattr(base, "__references__"):
+                base_references = [
+                    key
+                    for key in base.__references__
+                    if key not in not_reference_fields
+                ]
+                references = list(set(base_references + references))
 
         # NOTE: Duplicate key detection make sur that at most one primary key is
         # defined
@@ -448,7 +507,7 @@ class ModelMetaclass(BaseModelMetaclass):
         if namespace.get("__module__") != "odmantic.model" and namespace.get(
             "__qualname__"
         ) not in ("_BaseODMModel", "Model"):
-            mcs.__validate_cls_namespace__(name, namespace)
+            mcs.__validate_cls_namespace__(name, bases, namespace)
             config: ODMConfigDict = namespace["model_config"]
             primary_field: Optional[str] = None
             odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
@@ -503,7 +562,7 @@ class EmbeddedModelMetaclass(BaseModelMetaclass):
         if namespace.get("__module__") != "odmantic.model" and namespace.get(
             "__qualname__"
         ) not in ("_BaseODMModel", "EmbeddedModel"):
-            mcs.__validate_cls_namespace__(name, namespace)
+            mcs.__validate_cls_namespace__(name, bases, namespace)
             odm_fields: Dict[str, ODMBaseField] = namespace["__odm_fields__"]
             for field in odm_fields.values():
                 if isinstance(field, ODMField) and field.primary_field:

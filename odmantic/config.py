@@ -38,6 +38,25 @@ ODM_CONFIG_ALLOWED_CONFIG_OPTIONS = ODM_CONFIG_OPTIONS | PYDANTIC_ALLOWED_CONFIG
 ENFORCED_PYDANTIC_CONFIG = ConfigDict(validate_default=True, validate_assignment=True)
 
 
+def combine_configs(configs: Iterable[ODMConfigDict]) -> ODMConfigDict:
+    """Combine multiple model configurations into a single one.
+
+    Args:
+        configs: Iterable of configurations to combine. From child to parent.
+
+    Returns:
+        The merged configuration
+    """
+    configs = list(configs)
+    if not configs:
+        return ODMConfigDict()
+
+    merged_config = configs[0]
+    for config in configs[1:]:
+        merged_config.update(config)
+    return merged_config
+
+
 def validate_config(config: ODMConfigDict, cls_name: str) -> ODMConfigDict:
     """Validate the model configuration, enforcing some Pydantic options"""
     out_config: Dict[str, Any] = {
@@ -54,11 +73,14 @@ def validate_config(config: ODMConfigDict, cls_name: str) -> ODMConfigDict:
 
     for config_key, value in config.items():
         if config_key in ENFORCED_PYDANTIC_CONFIG:
-            raise ValueError(
-                f"'{cls_name}': configuration attribute '{config_key}' is "
-                f"enforced to {ENFORCED_PYDANTIC_CONFIG.get(config_key,'unknown')} "
-                "by ODMantic and cannot be changed"
-            )
+            if value != ENFORCED_PYDANTIC_CONFIG[config_key]:  # type: ignore
+                raise ValueError(
+                    f"'{cls_name}': configuration attribute '{config_key}' is "
+                    f"enforced to {ENFORCED_PYDANTIC_CONFIG.get(config_key,'unknown')} "
+                    "by ODMantic and cannot be changed"
+                )
+            else:
+                continue
         elif config_key in PYDANTIC_FORBIDDEN_CONFIG_OPTIONS:
             raise ValueError(
                 f"'{cls_name}': configuration attribute '{config_key}'"
